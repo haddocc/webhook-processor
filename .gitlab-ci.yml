@@ -1,0 +1,62 @@
+workflow: # run pipeline for..
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" # ... any commit on a merge request branch
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # ... any commit on the default branch
+
+stages:
+  - test/build
+  - deploy
+
+# there is a global cache configured on the runner, so you do not have to define caching options on at job level.
+test-build:
+  tags:
+    - custom
+  image:
+    name: jitesoft/composer:8.1
+  stage: test/build
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - vendor
+  before_script:
+    - curl --location --request POST 'https://matter.domain.eu/hooks/xxxxx' \
+      --header 'Content-Type: application/json' \
+      --data-raw '{"text":"%s Deployment for %s on `%s` %s. \n Initiated by '$testvar'. See [ref commit](%s)."}'
+    # do composer install for tests
+    - composer install --ignore-platform-reqs --no-progress --dev
+  script:
+    - ./vendor/phpunit/phpunit/phpunit tests
+    # if tests succeed we remove the vendor folder and install again for production
+    - rm -rf vendor
+    - composer install --ignore-platform-reqs --no-progress --no-dev
+
+deploy:
+  tags:
+    - custom
+  image: instrumentisto/rsync-ssh:latest
+  stage: deploy
+  needs: # if you do not define this explicitly every job willl get all previous artifacts from the last stage by default
+    - job: test-build
+  before_script:
+    - chmod 600 $CUSTOM_RUNNER_PRIVATE_KEY
+    ## Run ssh-agent (inside the build environment)
+    - eval $(ssh-agent -s)
+    ## Add the SSH key stored in SSH_PRIVATE_KEY variable to the agent store
+    ## We're using tr to fix line endings which makes ed25519 keys work
+    ## without extra base64 encoding.
+    ## https://gitlab.com/gitlab-examples/ssh-private-key/issues/1#note_48526556
+    - ssh-add $CUSTOM_RUNNER_PRIVATE_KEY
+    ## Create the SSH directory and give it the right permissions
+    - mkdir -p ~/.ssh
+    ## prevent unknown hosts prompt
+    - echo "$CUSTOM_DEV_KNOWN_HOSTS" > ~/.ssh/known_hosts
+    - chmod 700 ~/.ssh
+    - cp $CUSTOM_PROJECT_ENV_FILE env.example-dev # //!TODO env vars should be individually maintainable in the future
+  script: # rsync: -p = preserve permisions, -r = recursive, -v = verbose, -t = preserve timestamps, -n = dry run,
+    # -z = compress before and decompress after transfer (could be overhead),
+    # --inplace = tries to incrementally update a file rather than doing a full copy, comes in handy for large files, but also has some caveats,
+    # --delete = also delete files on target that do not exist on source anymore
+    - |- # using this notation so I can do multiline commands
+      rsync -rnv --exclude 'tests' --delete $(pwd)/* customdev@server.domain.eu:/var/www/vhosts/server.domain.eu;
+      rsync -prt --exclude 'tests' --delete  $(pwd)/* customdev@server.domain.eu:/var/www/vhosts/server.domain.eu;
+      ssh customdev@server.domain.eu 'yes | mv env.example-dev .env'
